@@ -18,13 +18,20 @@ enum State {
     FinWait1,
     FinWait2,
     TimeWait,
+    CloseWait,
+    Closing,
 }
 
 impl State {
     fn is_synchronized(&self) -> bool {
         match *self {
             State::SynRcvd => false,
-            State::Estab | State::FinWait1 | State::FinWait2 | State::TimeWait => true,
+            State::Estab
+            | State::FinWait1
+            | State::FinWait2
+            | State::TimeWait
+            | State::CloseWait
+            | State::Closing => true,
         }
     }
 }
@@ -51,8 +58,8 @@ struct Timers {
 
 impl Connection {
     pub(crate) fn is_rcv_closed(&self) -> bool {
-        if let State::TimeWait = self.state {
-            // TODO: any state after rcvd FIN, so also CLOSE-WAIT, LAST-ACK, CLOSED, CLOSING
+        // any state after having received the peer's FIN
+        if let State::TimeWait | State::CloseWait | State::Closing = self.state {
             true
         } else {
             false
@@ -448,7 +455,9 @@ impl Connection {
             }
         }
 
-        if let State::Estab | State::FinWait1 | State::FinWait2 = self.state {
+        if let State::Estab | State::FinWait1 | State::FinWait2 | State::CloseWait | State::Closing =
+            self.state
+        {
             if is_between_wrapped(self.send.una, ackn, self.send.nxt.wrapping_add(1)) {
                 println!(
                     "ack for {} (last: {}); prune in {:?}",
@@ -495,6 +504,15 @@ impl Connection {
             }
         }
 
+        if let State::Closing = self.state {
+            if let Some(closed_at) = self.closed_at {
+                if self.send.una == closed_at.wrapping_add(1) {
+                    // simultaneous close: our FIN has been ACKed too
+                    self.state = State::TimeWait;
+                }
+            }
+        }
+
         if !data.is_empty() {
             if let State::Estab | State::FinWait1 | State::FinWait2 = self.state {
                 let mut unread_data_at = self.recv.nxt.wrapping_sub(seqn) as usize;
@@ -528,7 +546,23 @@ impl Connection {
                     self.write(nic, self.send.nxt, 0)?;
                     self.state = State::TimeWait;
                 }
-                _ => unimplemented!(),
+                State::Estab => {
+                    // passive close: the peer is done sending, but we may not be
+                    self.recv.nxt = self.recv.nxt.wrapping_add(1);
+                    self.write(nic, self.send.nxt, 0)?;
+                    self.state = State::CloseWait;
+                }
+                State::FinWait1 => {
+                    // simultaneous close: our FIN is still unacknowledged
+                    self.recv.nxt = self.recv.nxt.wrapping_add(1);
+                    self.write(nic, self.send.nxt, 0)?;
+                    self.state = State::Closing;
+                }
+                State::TimeWait | State::CloseWait | State::Closing => {
+                    // duplicate FIN (RCV.NXT already covers it); just re-ACK
+                    self.write(nic, self.send.nxt, 0)?;
+                }
+                _ => {}
             }
         }
 
