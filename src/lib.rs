@@ -62,6 +62,16 @@ fn packet_loop(mut nic: Iface, ih: InterfaceHandle) -> io::Result<()> {
     let mut buf = [0u8; 1504];
 
     loop {
+        // once the Interface (and every listener/stream handle) is gone, tear
+        // down instead of lingering, so that dropping the Interface returns
+        let terminate = {
+            let cmg = ih.manager.lock().unwrap();
+            cmg.terminate && Arc::strong_count(&ih) == 1
+        };
+        if terminate {
+            return Ok(());
+        }
+
         // we want to read from nic, but we want to make sure that we'll wake up when the next
         // timer has to be triggered!
         use std::os::unix::io::AsRawFd;
@@ -70,16 +80,26 @@ fn packet_loop(mut nic: Iface, ih: InterfaceHandle) -> io::Result<()> {
             nix::poll::EventFlags::POLLIN,
         )];
         let n = nix::poll::poll(&mut pfd[..], 10).map_err(|e| e.as_errno().unwrap())?;
-        assert_ne!(n, -1);
         if n == 0 {
             let mut cmg = ih.manager.lock().unwrap();
-            for connection in cmg.connections.values_mut() {
-                // XXX: don't die on errors?
-                let a = connection.on_tick(&mut nic)?;
+            let mut errored = Vec::new();
+            for (q, connection) in cmg.connections.iter_mut() {
+                let a = match connection.on_tick(&mut nic) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        // one sick connection must not take down the whole stack
+                        eprintln!("error ticking {:?}: {}; dropping connection", q, e);
+                        errored.push(*q);
+                        continue;
+                    }
+                };
                 // TODO: compare before/after
                 if a.contains(tcp::Available::READ) {
                     ih.rcv_var.notify_all()
                 }
+            }
+            for q in errored {
+                cmg.connections.remove(&q);
             }
             // reclaim fully-closed connections (post-TIME-WAIT or LAST-ACK)
             cmg.connections.retain(|q, c| {
@@ -91,10 +111,7 @@ fn packet_loop(mut nic: Iface, ih: InterfaceHandle) -> io::Result<()> {
             });
             continue;
         }
-        assert_eq!(n, 1);
         let nbytes = nic.recv(&mut buf[..])?;
-
-        // TODO: if self.terminate && Arc::get_strong_refs(ih) == 1; then tear down all connections and return.
 
         // if s/without_packet_info/new/:
         //
@@ -131,12 +148,25 @@ fn packet_loop(mut nic: Iface, ih: InterfaceHandle) -> io::Result<()> {
                         match cm.connections.entry(q) {
                             Entry::Occupied(mut c) => {
                                 eprintln!("got packet for known quad {:?}", q);
-                                let a = c.get_mut().on_packet(
+                                let a = match c.get_mut().on_packet(
                                     &mut nic,
                                     iph,
                                     tcph,
                                     &buf[datai..nbytes],
-                                )?;
+                                ) {
+                                    Ok(a) => a,
+                                    Err(e) => {
+                                        // one sick connection must not take down the whole stack
+                                        eprintln!(
+                                            "error handling packet for {:?}: {}; dropping connection",
+                                            q, e
+                                        );
+                                        c.remove();
+                                        drop(cmg);
+                                        ih.rcv_var.notify_all();
+                                        continue;
+                                    }
+                                };
 
                                 // TODO: compare before/after
                                 drop(cmg);
@@ -152,16 +182,22 @@ fn packet_loop(mut nic: Iface, ih: InterfaceHandle) -> io::Result<()> {
                                 if let Some(pending) = cm.pending.get_mut(&tcph.destination_port())
                                 {
                                     eprintln!("listening, so accepting");
-                                    if let Some(c) = tcp::Connection::accept(
+                                    match tcp::Connection::accept(
                                         &mut nic,
                                         iph,
                                         tcph,
                                         &buf[datai..nbytes],
-                                    )? {
-                                        e.insert(c);
-                                        pending.push_back(q);
-                                        drop(cmg);
-                                        ih.pending_var.notify_all()
+                                    ) {
+                                        Ok(Some(c)) => {
+                                            e.insert(c);
+                                            pending.push_back(q);
+                                            drop(cmg);
+                                            ih.pending_var.notify_all()
+                                        }
+                                        Ok(None) => {}
+                                        Err(err) => {
+                                            eprintln!("error accepting {:?}: {}", q, err)
+                                        }
                                     }
                                 }
                             }
@@ -293,6 +329,13 @@ impl Read for TcpStream {
                 )
             })?;
 
+            if c.reset {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    "connection reset by peer",
+                ));
+            }
+
             if c.is_rcv_closed() && c.incoming.is_empty() {
                 // no more data to read, and no need to block, because there won't be any more
                 return Ok(0);
@@ -326,6 +369,13 @@ impl Write for TcpStream {
             )
         })?;
 
+        if c.reset {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "connection reset by peer",
+            ));
+        }
+
         if c.unacked.len() >= SENDQUEUE_SIZE {
             // TODO: block
             return Err(io::Error::new(
@@ -349,6 +399,13 @@ impl Write for TcpStream {
             )
         })?;
 
+        if c.reset {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "connection reset by peer",
+            ));
+        }
+
         if c.unacked.is_empty() {
             Ok(())
         } else {
@@ -370,6 +427,13 @@ impl TcpStream {
                 "stream was terminated unexpectedly",
             )
         })?;
+
+        if c.reset {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "connection reset by peer",
+            ));
+        }
 
         c.close()
     }

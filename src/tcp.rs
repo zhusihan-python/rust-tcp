@@ -60,6 +60,8 @@ pub struct Connection {
     pub(crate) closed: bool,
     closed_at: Option<u32>,
     entered_timewait: Option<time::Instant>,
+    /// set when the peer sent a RST; reads and writes must fail, not see EOF
+    pub(crate) reset: bool,
 }
 
 struct Timers {
@@ -90,7 +92,7 @@ impl Connection {
 
     fn availability(&self) -> Available {
         let mut a = Available::empty();
-        if self.is_rcv_closed() || !self.incoming.is_empty() {
+        if self.reset || self.is_rcv_closed() || !self.incoming.is_empty() {
             a |= Available::READ;
         }
         // TODO: take into account self.state
@@ -217,6 +219,7 @@ impl Connection {
             closed: false,
             closed_at: None,
             entered_timewait: None,
+            reset: false,
         };
 
         // need to start establishing a connection
@@ -375,7 +378,24 @@ impl Connection {
         // eprintln!("ON TICK: state {:?} una {} nxt {} unacked {:?}",
         //           self.state, self.send.una, self.send.nxt, self.unacked);
 
-        let nunacked_data = self.closed_at.unwrap_or(self.send.nxt).wrapping_sub(self.send.una);
+        // count only real data bytes in flight: the SYN and FIN occupy
+        // sequence numbers but not the unacked buffer, and leaving them in
+        // made this underflow (and flood the peer with empty segments)
+        let mut nunacked_data = self.send.nxt.wrapping_sub(self.send.una);
+        if self.send.una == self.send.iss {
+            // our SYN has not been acknowledged yet
+            nunacked_data -= 1;
+        }
+        if let Some(closed_at) = self.closed_at {
+            if wrapping_lt(self.send.una, closed_at.wrapping_add(1)) {
+                // our FIN has not been acknowledged yet
+                nunacked_data -= 1;
+            }
+        }
+        debug_assert!(
+            nunacked_data <= self.unacked.len() as u32,
+            "in-flight data exceeds queued data"
+        );
         let nunsent_data = self.unacked.len() as u32 - nunacked_data;
 
         let waited_for = self
@@ -402,7 +422,9 @@ impl Connection {
             self.write(nic, self.send.una, resend as usize)?;
         } else {
             // we should send new data if we have new data and space in the window
-            if nunsent_data == 0 && self.closed_at.is_some() {
+            // (nothing to do when idle, or once everything incl. our FIN is
+            // in flight; a scheduled-but-unsent FIN still needs sending)
+            if nunsent_data == 0 && (!self.closed || self.closed_at.is_some()) {
                 return Ok(self.availability());
             }
 
@@ -472,6 +494,17 @@ impl Connection {
         if !okay {
             eprintln!("NOT OKAY");
             self.write(nic, self.send.nxt, 0)?;
+            return Ok(self.availability());
+        }
+
+        if tcph.rst() {
+            // the peer has aborted the connection (RFC 793 S3.4 "reset
+            // processing"); discard any buffered data — the read side must
+            // see an error, not a clean EOF — and let the packet loop
+            // reclaim the connection once it reaches CLOSED
+            eprintln!("got RST; aborting connection");
+            self.state = State::Closed;
+            self.reset = true;
             return Ok(self.availability());
         }
 
@@ -575,10 +608,10 @@ impl Connection {
             if let State::Estab | State::FinWait1 | State::FinWait2 = self.state {
                 let mut unread_data_at = self.recv.nxt.wrapping_sub(seqn) as usize;
                 if unread_data_at > data.len() {
-                    // we must have received a re-transmitted FIN that we have already seen
-                    // nxt points to beyond the fin, but the fin is not in data!
-                    assert_eq!(unread_data_at, data.len() + 1);
-                    unread_data_at = 0;
+                    // a fully-consumed retransmission: RCV.NXT is already
+                    // beyond this segment's data (its FIN, or later segments,
+                    // advanced it), so nothing in here is new
+                    unread_data_at = data.len();
                 }
                 self.incoming.extend(&data[unread_data_at..]);
 
@@ -588,7 +621,12 @@ impl Connection {
                 apporopriate to the current buffer availability.  The total of
                 RCV.NXT and RCV.WND should not be reduced.
                  */
-                self.recv.nxt = seqn.wrapping_add(data.len() as u32);
+                let new_nxt = seqn.wrapping_add(data.len() as u32);
+                if wrapping_lt(self.recv.nxt, new_nxt) {
+                    // never move RCV.NXT backwards (fully-consumed
+                    // retransmissions must not rewind it)
+                    self.recv.nxt = new_nxt;
+                }
 
                 // Send an acknowledgment of the form: <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
                 // TODO: maybe just tick to piggyback ack on data?
@@ -709,6 +747,7 @@ mod tests {
             closed: false,
             closed_at: None,
             entered_timewait: None,
+            reset: false,
         }
     }
 
