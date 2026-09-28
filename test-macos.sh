@@ -8,7 +8,7 @@ set -u
 
 fail() {
   echo "FAIL: $*" >&2
-  sudo pkill -f 'target/release/trust' 2>/dev/null || true
+  sudo pkill -x trust 2>/dev/null || true
   exit 1
 }
 
@@ -39,10 +39,15 @@ done
 [[ -n "$tun" ]] || fail "no new utun interface appeared (did sudo succeed?)"
 echo "interface: $tun"
 
-sudo ifconfig "$tun" 192.168.0.1 192.168.0.2 up || fail "ifconfig failed"
+# 198.18.0.0/15 is the RFC 2544 benchmark range: real LANs never use it, so the
+# utun addresses cannot collide with the host's physical network (e.g. a home
+# router on 192.168.0.0/24, which the old addresses collided with). The /32
+# mask keeps subnet multicast (mDNS etc.) off the utun interface.
+sudo ifconfig "$tun" 198.18.0.1 198.18.0.2 netmask 255.255.255.255 up \
+  || fail "ifconfig failed"
 
 # test 1: kernel-side client receives the greeting sent by our userspace TCP
-out=$(printf 'ping\n' | nc -w 5 192.168.0.2 8000)
+out=$(printf 'ping\n' | nc -w 5 198.18.0.2 8000)
 if [[ "$out" == "hello from rust-tcp!" ]]; then
   echo "PASS: received greeting over userspace TCP"
 else
@@ -57,5 +62,5 @@ else
   fail "server never logged the client data; server.log tail: $(tail -5 server.log)"
 fi
 
-sudo pkill -f 'target/release/trust' 2>/dev/null || true
+sudo pkill -x trust 2>/dev/null || true
 echo "ALL TESTS PASSED"

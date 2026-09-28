@@ -34,7 +34,9 @@ if [[ "$(uname)" == "Darwin" ]]; then
     exit 1
   fi
   echo "using interface $tun"
-  sudo ifconfig "$tun" 192.168.0.1 192.168.0.2 up
+  # 198.18.0.0/15 (RFC 2544 benchmark range) cannot collide with real LANs;
+  # /32 keeps subnet multicast off the interface
+  sudo ifconfig "$tun" 198.18.0.1 198.18.0.2 netmask 255.255.255.255 up
   trap "kill $pid" INT TERM
   wait $pid
 else
