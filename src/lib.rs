@@ -75,8 +75,14 @@ fn packet_loop(mut nic: Iface, ih: InterfaceHandle) -> io::Result<()> {
             let mut cmg = ih.manager.lock().unwrap();
             for connection in cmg.connections.values_mut() {
                 // XXX: don't die on errors?
-                connection.on_tick(&mut nic)?;
+                let a = connection.on_tick(&mut nic)?;
+                // TODO: compare before/after
+                if a.contains(tcp::Available::READ) {
+                    ih.rcv_var.notify_all()
+                }
             }
+            // reclaim fully-closed connections (post-TIME-WAIT or LAST-ACK)
+            cmg.connections.retain(|_, c| !c.is_done());
             continue;
         }
         assert_eq!(n, 1);
@@ -223,9 +229,11 @@ impl Drop for TcpListener {
             .remove(&self.port)
             .expect("port closed while listener still active");
 
-        for _quad in pending {
-            // TODO: terminate cm.connections[quad]
-            unimplemented!();
+        for quad in pending {
+            // the streams for these quads are going away with the listener;
+            // abandon the connections rather than wait for a close handshake
+            // TODO: send RST via cm.connections[quad] so the peer finds out now
+            cm.connections.remove(&quad);
         }
     }
 }
@@ -258,9 +266,13 @@ pub struct TcpStream {
 
 impl Drop for TcpStream {
     fn drop(&mut self) {
-        let _cm = self.h.manager.lock().unwrap();
-        // TODO: send FIN on cm.connections[quad]
-        // TODO: _eventually_ remove self.quad from cm.connections
+        let mut cm = self.h.manager.lock().unwrap();
+        // initiate our close so the FIN handshake starts even if the
+        // application never called shutdown(); the packet loop reclaims the
+        // connection once the handshake finishes
+        if let Some(c) = cm.connections.get_mut(&self.quad) {
+            let _ = c.close();
+        }
     }
 }
 

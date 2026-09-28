@@ -20,10 +20,12 @@ enum State {
     TimeWait,
     CloseWait,
     Closing,
+    LastAck,
+    Closed,
 }
 
 impl State {
-    #[allow(dead_code)] // for synchronized-state segment rules (RFC 793 S3.4), not yet wired up
+    #[allow(dead_code)] // for synchronized-state segment rules (RFC 793 S3.3), not yet wired up
     fn is_synchronized(&self) -> bool {
         match *self {
             State::SynRcvd => false,
@@ -32,10 +34,17 @@ impl State {
             | State::FinWait2
             | State::TimeWait
             | State::CloseWait
-            | State::Closing => true,
+            | State::Closing
+            | State::LastAck
+            | State::Closed => true,
         }
     }
 }
+
+/// How long a fully-closed connection lingers in TIME-WAIT before the packet
+/// loop reclaims it. Real stacks wait 2*MSL (up to 4 minutes) to catch peer
+/// FIN retransmissions; shortened here so the reclamation is observable.
+const TIME_WAIT: time::Duration = time::Duration::from_secs(10);
 
 pub struct Connection {
     state: State,
@@ -50,6 +59,7 @@ pub struct Connection {
 
     pub(crate) closed: bool,
     closed_at: Option<u32>,
+    entered_timewait: Option<time::Instant>,
 }
 
 struct Timers {
@@ -60,7 +70,18 @@ struct Timers {
 impl Connection {
     pub(crate) fn is_rcv_closed(&self) -> bool {
         // any state after having received the peer's FIN
-        if let State::TimeWait | State::CloseWait | State::Closing = self.state {
+        if let State::TimeWait | State::CloseWait | State::Closing | State::LastAck | State::Closed =
+            self.state
+        {
+            true
+        } else {
+            false
+        }
+    }
+
+    /// the connection is fully closed and can be reclaimed by the packet loop
+    pub(crate) fn is_done(&self) -> bool {
+        if let State::Closed = self.state {
             true
         } else {
             false
@@ -195,6 +216,7 @@ impl Connection {
 
             closed: false,
             closed_at: None,
+            entered_timewait: None,
         };
 
         // need to start establishing a connection
@@ -326,10 +348,28 @@ impl Connection {
         Ok(())
     }
 
-    pub(crate) fn on_tick(&mut self, nic: &mut Iface) -> io::Result<()> {
-        if let State::FinWait2 | State::TimeWait = self.state {
+    pub(crate) fn on_tick(&mut self, nic: &mut Iface) -> io::Result<Available> {
+        if let State::FinWait2 = self.state {
             // we have shutdown our write side and the other side acked, no need to (re)transmit anything
-            return Ok(());
+            // TODO: time out and reclaim if the peer never sends its FIN
+            return Ok(self.availability());
+        }
+
+        if let State::TimeWait = self.state {
+            // linger briefly to catch peer FIN retransmissions, then let the
+            // packet loop reclaim the connection
+            if self
+                .entered_timewait
+                .map(|t| t.elapsed() > TIME_WAIT)
+                .unwrap_or(false)
+            {
+                self.state = State::Closed;
+            }
+            return Ok(self.availability());
+        }
+
+        if let State::Closed = self.state {
+            return Ok(self.availability());
         }
 
         // eprintln!("ON TICK: state {:?} una {} nxt {} unacked {:?}",
@@ -363,12 +403,12 @@ impl Connection {
         } else {
             // we should send new data if we have new data and space in the window
             if nunsent_data == 0 && self.closed_at.is_some() {
-                return Ok(());
+                return Ok(self.availability());
             }
 
             let allowed = self.send.wnd as u32 - nunacked_data;
             if allowed == 0 {
-                return Ok(());
+                return Ok(self.availability());
             }
 
             let send = std::cmp::min(nunsent_data, allowed);
@@ -380,7 +420,7 @@ impl Connection {
             self.write(nic, self.send.nxt, send as usize)?;
         }
 
-        Ok(())
+        Ok(self.availability())
     }
 
     pub(crate) fn on_packet<'a>(
@@ -459,8 +499,12 @@ impl Connection {
             }
         }
 
-        if let State::Estab | State::FinWait1 | State::FinWait2 | State::CloseWait | State::Closing =
-            self.state
+        if let State::Estab
+        | State::FinWait1
+        | State::FinWait2
+        | State::CloseWait
+        | State::Closing
+        | State::LastAck = self.state
         {
             if is_between_wrapped(self.send.una, ackn, self.send.nxt.wrapping_add(1)) {
                 println!(
@@ -513,6 +557,16 @@ impl Connection {
                 if self.send.una == closed_at.wrapping_add(1) {
                     // simultaneous close: our FIN has been ACKed too
                     self.state = State::TimeWait;
+                    self.entered_timewait = Some(time::Instant::now());
+                }
+            }
+        }
+
+        if let State::LastAck = self.state {
+            if let Some(closed_at) = self.closed_at {
+                if self.send.una == closed_at.wrapping_add(1) {
+                    // passive close finished: our FIN has been ACKed
+                    self.state = State::Closed;
                 }
             }
         }
@@ -549,6 +603,7 @@ impl Connection {
                     self.recv.nxt = self.recv.nxt.wrapping_add(1);
                     self.write(nic, self.send.nxt, 0)?;
                     self.state = State::TimeWait;
+                    self.entered_timewait = Some(time::Instant::now());
                 }
                 State::Estab => {
                     // passive close: the peer is done sending, but we may not be
@@ -562,7 +617,11 @@ impl Connection {
                     self.write(nic, self.send.nxt, 0)?;
                     self.state = State::Closing;
                 }
-                State::TimeWait | State::CloseWait | State::Closing => {
+                State::TimeWait
+                | State::CloseWait
+                | State::Closing
+                | State::LastAck
+                | State::Closed => {
                     // duplicate FIN (RCV.NXT already covers it); just re-ACK
                     self.write(nic, self.send.nxt, 0)?;
                 }
@@ -579,7 +638,12 @@ impl Connection {
             State::SynRcvd | State::Estab => {
                 self.state = State::FinWait1;
             }
-            State::FinWait1 | State::FinWait2 => {}
+            State::FinWait1 | State::FinWait2 | State::Closing => {}
+            State::CloseWait => {
+                // passive close: we already saw the peer's FIN; once ours is
+                // ACKed the connection is finished
+                self.state = State::LastAck;
+            }
             _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::NotConnected,
