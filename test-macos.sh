@@ -14,6 +14,10 @@ fail() {
 
 cargo b --release || fail "build failed"
 
+# authenticate before backgrounding: a password prompt from the backgrounded
+# sudo would race the interface-detection loop below
+sudo -v || fail "sudo authentication failed"
+
 before=$(ifconfig -l)
 sudo ./target/release/trust 2>server.log &
 

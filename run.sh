@@ -8,6 +8,9 @@ fi
 if [[ "$(uname)" == "Darwin" ]]; then
   # macOS: utun requires root (no setcap equivalent), and the interface is
   # created by the process itself, so detect it by diffing the interface list.
+  # authenticate before backgrounding so the password prompt can't race the
+  # detection loop
+  sudo -v
   before=$(ifconfig -l)
   sudo ./target/release/trust &
   pid=$!
