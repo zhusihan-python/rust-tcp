@@ -4,9 +4,9 @@
 //! created by connecting a PF_SYSTEM/SYSPROTO_CONTROL socket to the
 //! "com.apple.net.utun_control" kernel control. Unlike Linux TUN opened with
 //! IFF_NO_PI, every packet read from or written to such a socket is prefixed
-//! with a 4-byte host-byte-order address-family header that cannot be turned
-//! off. This wrapper strips and re-adds that header so that the rest of this
-//! crate sees raw IP packets, just like the Linux code path.
+//! with a 4-byte address-family header (network byte order) that cannot be
+//! turned off. This wrapper strips and re-adds that header so that the rest of
+//! this crate sees raw IP packets, just like the Linux code path.
 //!
 //! Layout constants mirror <sys/kern_control.h> and <sys/socket.h>, which the
 //! libc crate does not expose portably across versions.
@@ -133,7 +133,10 @@ impl Iface {
                 "packet too large for utun",
             ));
         }
-        self.out[..4].copy_from_slice(&(libc::AF_INET as u32).to_ne_bytes());
+        // XNU's utun_ctl_send() ntohl()-swaps these four bytes, and
+        // utun_output() htonl()-swaps them on the way out: the ABI is
+        // network byte order, not host byte order
+        self.out[..4].copy_from_slice(&(libc::AF_INET as u32).to_be_bytes());
         self.out[4..4 + buf.len()].copy_from_slice(buf);
         let n = unsafe {
             libc::write(
