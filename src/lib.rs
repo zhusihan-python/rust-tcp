@@ -82,7 +82,13 @@ fn packet_loop(mut nic: Iface, ih: InterfaceHandle) -> io::Result<()> {
                 }
             }
             // reclaim fully-closed connections (post-TIME-WAIT or LAST-ACK)
-            cmg.connections.retain(|_, c| !c.is_done());
+            cmg.connections.retain(|q, c| {
+                let done = c.is_done();
+                if done {
+                    eprintln!("reclaiming closed connection {:?}", q);
+                }
+                !done
+            });
             continue;
         }
         assert_eq!(n, 1);

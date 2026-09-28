@@ -1,0 +1,12 @@
+created utun interface utun9
+created interface
+got packet for unknown quad Quad { src: (198.18.0.1, 62040), dst: (198.18.0.2, 8000) }
+listening, so accepting
+got connection!
+got packet for known quad Quad { src: (198.18.0.1, 62040), dst: (198.18.0.2, 8000) }
+got packet for known quad Quad { src: (198.18.0.1, 62040), dst: (198.18.0.2, 8000) }
+read 5b of data
+got packet for known quad Quad { src: (198.18.0.1, 62040), dst: (198.18.0.2, 8000) }
+read 0b of data
+no more data!
+got packet for known quad Quad { src: (198.18.0.1, 62040), dst: (198.18.0.2, 8000) }
