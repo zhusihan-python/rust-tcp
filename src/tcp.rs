@@ -669,3 +669,178 @@ fn wrapping_lt(lhs: u32, rhs: u32) -> bool {
 fn is_between_wrapped(start: u32, x: u32, end: u32) -> bool {
     wrapping_lt(start, x) && wrapping_lt(x, end)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn conn_in(state: State) -> Connection {
+        Connection {
+            state,
+            send: SendSequenceSpace {
+                iss: 1000,
+                una: 1000,
+                nxt: 1000,
+                wnd: 1024,
+                up: false,
+                wl1: 0,
+                wl2: 0,
+            },
+            recv: RecvSequenceSpace {
+                nxt: 5000,
+                wnd: 1024,
+                up: false,
+                irs: 4999,
+            },
+            ip: etherparse::Ipv4Header::new(
+                0,
+                64,
+                etherparse::IpTrafficClass::Tcp,
+                [10, 0, 0, 1],
+                [10, 0, 0, 2],
+            ),
+            tcp: etherparse::TcpHeader::new(8000, 9000, 1000, 1024),
+            timers: Timers {
+                send_times: BTreeMap::new(),
+                srtt: 60.0,
+            },
+            incoming: Default::default(),
+            unacked: Default::default(),
+            closed: false,
+            closed_at: None,
+            entered_timewait: None,
+        }
+    }
+
+    #[test]
+    fn wrapping_lt_basics() {
+        assert!(!wrapping_lt(5, 5));
+        assert!(wrapping_lt(5, 6));
+        assert!(!wrapping_lt(6, 5));
+        // crossing the 2^32 boundary
+        assert!(wrapping_lt(0xFFFFFFF0, 0x10));
+        assert!(!wrapping_lt(0x10, 0xFFFFFFF0));
+    }
+
+    #[test]
+    fn wrapping_lt_half_domain_boundary() {
+        // exactly 2^31 apart is on the boundary and not "less" (RFC 1323)
+        assert!(!wrapping_lt(0, 1 << 31));
+        assert!(!wrapping_lt(1 << 31, 0));
+        // just under 2^31 apart is less, in both wrap directions
+        assert!(wrapping_lt(0, (1 << 31) - 1));
+        assert!(wrapping_lt((1 << 31) + 1, 0));
+    }
+
+    #[test]
+    fn is_between_wrapped_cases() {
+        assert!(is_between_wrapped(0, 1, 10));
+        // both ends are exclusive
+        assert!(!is_between_wrapped(0, 0, 10));
+        assert!(!is_between_wrapped(0, 10, 10));
+        assert!(!is_between_wrapped(0, 11, 10));
+        // windows spanning the 2^32 boundary
+        assert!(is_between_wrapped(0xFFFFFFF8, 5, 16));
+        assert!(!is_between_wrapped(5, 0xFFFFFFF8, 16));
+    }
+
+    #[test]
+    fn states_after_peer_fin_are_rcv_closed() {
+        let closed = [
+            State::CloseWait,
+            State::Closing,
+            State::TimeWait,
+            State::LastAck,
+            State::Closed,
+        ];
+        for state in closed {
+            let name = format!("{:?}", state);
+            assert!(conn_in(state).is_rcv_closed(), "{} should be rcv-closed", name);
+        }
+        let open = [
+            State::SynRcvd,
+            State::Estab,
+            State::FinWait1,
+            State::FinWait2,
+        ];
+        for state in open {
+            let name = format!("{:?}", state);
+            assert!(!conn_in(state).is_rcv_closed(), "{} should not be rcv-closed", name);
+        }
+    }
+
+    #[test]
+    fn only_closed_is_done() {
+        assert!(conn_in(State::Closed).is_done());
+        let not_done = [
+            State::SynRcvd,
+            State::Estab,
+            State::FinWait1,
+            State::FinWait2,
+            State::TimeWait,
+            State::CloseWait,
+            State::Closing,
+            State::LastAck,
+        ];
+        for state in not_done {
+            let name = format!("{:?}", state);
+            assert!(!conn_in(state).is_done(), "{} is not done", name);
+        }
+    }
+
+    #[test]
+    fn synchronized_states() {
+        assert!(!conn_in(State::SynRcvd).state.is_synchronized());
+        let synced = [
+            State::Estab,
+            State::FinWait1,
+            State::FinWait2,
+            State::TimeWait,
+            State::CloseWait,
+            State::Closing,
+            State::LastAck,
+            State::Closed,
+        ];
+        for state in synced {
+            let name = format!("{:?}", state);
+            assert!(conn_in(state).state.is_synchronized(), "{} is synchronized", name);
+        }
+    }
+
+    #[test]
+    fn close_transitions() {
+        // active close
+        let mut c = conn_in(State::Estab);
+        c.close().unwrap();
+        assert!(matches!(c.state, State::FinWait1));
+        assert!(c.closed);
+
+        let mut c = conn_in(State::SynRcvd);
+        c.close().unwrap();
+        assert!(matches!(c.state, State::FinWait1));
+
+        // passive close
+        let mut c = conn_in(State::CloseWait);
+        c.close().unwrap();
+        assert!(matches!(c.state, State::LastAck));
+        assert!(c.closed);
+
+        // already closing: idempotent
+        let mut c = conn_in(State::FinWait1);
+        c.close().unwrap();
+        assert!(matches!(c.state, State::FinWait1));
+
+        let mut c = conn_in(State::FinWait2);
+        c.close().unwrap();
+        assert!(matches!(c.state, State::FinWait2));
+
+        let mut c = conn_in(State::Closing);
+        c.close().unwrap();
+        assert!(matches!(c.state, State::Closing));
+
+        // fully closing/closed: error
+        assert!(conn_in(State::TimeWait).close().is_err());
+        assert!(conn_in(State::LastAck).close().is_err());
+        assert!(conn_in(State::Closed).close().is_err());
+    }
+}
