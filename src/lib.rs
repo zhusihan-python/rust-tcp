@@ -7,6 +7,14 @@ use std::thread;
 
 mod tcp;
 
+#[cfg(target_os = "macos")]
+mod utun;
+
+#[cfg(target_os = "linux")]
+pub(crate) use tun_tap::Iface;
+#[cfg(target_os = "macos")]
+pub(crate) use utun::Iface;
+
 const SENDQUEUE_SIZE: usize = 1024;
 
 #[derive(Clone, Copy, Debug, Hash, Eq, PartialEq)]
@@ -50,7 +58,7 @@ struct ConnectionManager {
     pending: HashMap<u16, VecDeque<Quad>>,
 }
 
-fn packet_loop(mut nic: tun_tap::Iface, ih: InterfaceHandle) -> io::Result<()> {
+fn packet_loop(mut nic: Iface, ih: InterfaceHandle) -> io::Result<()> {
     let mut buf = [0u8; 1504];
 
     loop {
@@ -161,7 +169,10 @@ fn packet_loop(mut nic: tun_tap::Iface, ih: InterfaceHandle) -> io::Result<()> {
 
 impl Interface {
     pub fn new() -> io::Result<Self> {
-        let nic = tun_tap::Iface::without_packet_info("tun0", tun_tap::Mode::Tun)?;
+        #[cfg(target_os = "linux")]
+        let nic = Iface::without_packet_info("tun0", tun_tap::Mode::Tun)?;
+        #[cfg(target_os = "macos")]
+        let nic = Iface::new()?;
 
         let ih: InterfaceHandle = Arc::default();
 
