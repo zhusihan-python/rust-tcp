@@ -90,6 +90,15 @@ impl Connection {
         }
     }
 
+    /// force the connection to CLOSED and fail outstanding reads/writes
+    /// with ConnectionReset. The packet loop reclaims the connection once
+    /// no stream still references it, so the reset keeps surfacing for as
+    /// long as a handle exists.
+    pub(crate) fn abort(&mut self) {
+        self.state = State::Closed;
+        self.reset = true;
+    }
+
     fn availability(&self) -> Available {
         let mut a = Available::empty();
         if self.reset || self.is_rcv_closed() || !self.incoming.is_empty() {
@@ -500,11 +509,13 @@ impl Connection {
         if tcph.rst() {
             // the peer has aborted the connection (RFC 793 S3.4 "reset
             // processing"); discard any buffered data — the read side must
-            // see an error, not a clean EOF — and let the packet loop
-            // reclaim the connection once it reaches CLOSED
+            // see an error, not a clean EOF.
+            //
+            // NOTE: the sequence check above gates this, which is right for
+            // synchronized states; in SYN-RCVD the RFC would check RST
+            // first — an accepted simplification in this stack.
             eprintln!("got RST; aborting connection");
-            self.state = State::Closed;
-            self.reset = true;
+            self.abort();
             return Ok(self.availability());
         }
 
@@ -608,9 +619,9 @@ impl Connection {
             if let State::Estab | State::FinWait1 | State::FinWait2 = self.state {
                 let mut unread_data_at = self.recv.nxt.wrapping_sub(seqn) as usize;
                 if unread_data_at > data.len() {
-                    // a fully-consumed retransmission: RCV.NXT is already
-                    // beyond this segment's data (its FIN, or later segments,
-                    // advanced it), so nothing in here is new
+                    // a fully-consumed retransmission: a later segment already
+                    // advanced RCV.NXT past this segment's data, so nothing
+                    // in here is new
                     unread_data_at = data.len();
                 }
                 self.incoming.extend(&data[unread_data_at..]);
@@ -844,6 +855,16 @@ mod tests {
             let name = format!("{:?}", state);
             assert!(conn_in(state).state.is_synchronized(), "{} is synchronized", name);
         }
+    }
+
+    #[test]
+    fn abort_closes_and_resets() {
+        let mut c = conn_in(State::Estab);
+        c.abort();
+        assert!(matches!(c.state, State::Closed));
+        assert!(c.reset);
+        assert!(c.is_done());
+        assert!(c.is_rcv_closed());
     }
 
     #[test]

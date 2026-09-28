@@ -37,6 +37,11 @@ pub struct Interface {
     jh: Option<thread::JoinHandle<io::Result<()>>>,
 }
 
+// Dropping an Interface asks the packet loop to tear down, but only once
+// every TcpListener/TcpStream cloned from it has been dropped too (the
+// loop counts handle references); a leaked handle keeps the loop — and
+// blocks this drop — alive.
+
 impl Drop for Interface {
     fn drop(&mut self) {
         self.ih.as_mut().unwrap().manager.lock().unwrap().terminate = true;
@@ -56,6 +61,10 @@ struct ConnectionManager {
     terminate: bool,
     connections: HashMap<Quad, tcp::Connection>,
     pending: HashMap<u16, VecDeque<Quad>>,
+    /// live TcpStream handles per quad. Fully-closed connections are only
+    /// reclaimed once this drops to zero, so a reset or abort keeps
+    /// surfacing to the stream for as long as it exists.
+    streams: HashMap<Quad, usize>,
 }
 
 fn packet_loop(mut nic: Iface, ih: InterfaceHandle) -> io::Result<()> {
@@ -82,14 +91,15 @@ fn packet_loop(mut nic: Iface, ih: InterfaceHandle) -> io::Result<()> {
         let n = nix::poll::poll(&mut pfd[..], 10).map_err(|e| e.as_errno().unwrap())?;
         if n == 0 {
             let mut cmg = ih.manager.lock().unwrap();
-            let mut errored = Vec::new();
+            let mut errored = false;
             for (q, connection) in cmg.connections.iter_mut() {
                 let a = match connection.on_tick(&mut nic) {
                     Ok(a) => a,
                     Err(e) => {
                         // one sick connection must not take down the whole stack
-                        eprintln!("error ticking {:?}: {}; dropping connection", q, e);
-                        errored.push(*q);
+                        eprintln!("error ticking {:?}: {}; aborting connection", q, e);
+                        connection.abort();
+                        errored = true;
                         continue;
                     }
                 };
@@ -98,16 +108,26 @@ fn packet_loop(mut nic: Iface, ih: InterfaceHandle) -> io::Result<()> {
                     ih.rcv_var.notify_all()
                 }
             }
-            for q in errored {
-                cmg.connections.remove(&q);
+            if errored {
+                // wake readers of aborted connections so they see the error
+                ih.rcv_var.notify_all();
             }
-            // reclaim fully-closed connections (post-TIME-WAIT or LAST-ACK)
-            cmg.connections.retain(|q, c| {
+            // reclaim fully-closed connections (post-TIME-WAIT, LAST-ACK or
+            // abort), but only once no stream handle still references them
+            let cm = &mut *cmg;
+            let streams = &cm.streams;
+            cm.connections.retain(|q, c| {
                 let done = c.is_done();
-                if done {
-                    eprintln!("reclaiming closed connection {:?}", q);
+                if !done {
+                    return true;
                 }
-                !done
+                if streams.get(q).copied().unwrap_or(0) > 0 {
+                    // a live TcpStream still points here (e.g. waiting to
+                    // observe a reset); reclaim once it is gone
+                    return true;
+                }
+                eprintln!("reclaiming closed connection {:?}", q);
+                false
             });
             continue;
         }
@@ -158,10 +178,10 @@ fn packet_loop(mut nic: Iface, ih: InterfaceHandle) -> io::Result<()> {
                                     Err(e) => {
                                         // one sick connection must not take down the whole stack
                                         eprintln!(
-                                            "error handling packet for {:?}: {}; dropping connection",
+                                            "error handling packet for {:?}: {}; aborting connection",
                                             q, e
                                         );
-                                        c.remove();
+                                        c.get_mut().abort();
                                         drop(cmg);
                                         ih.rcv_var.notify_all();
                                         continue;
@@ -290,6 +310,7 @@ impl TcpListener {
                 .expect("port closed while listener still active")
                 .pop_front()
             {
+                *cm.streams.entry(quad).or_insert(0) += 1;
                 return Ok(TcpStream {
                     quad,
                     h: self.h.clone(),
@@ -311,9 +332,15 @@ impl Drop for TcpStream {
         let mut cm = self.h.manager.lock().unwrap();
         // initiate our close so the FIN handshake starts even if the
         // application never called shutdown(); the packet loop reclaims the
-        // connection once the handshake finishes
+        // connection once the handshake finishes and the last handle is gone
         if let Some(c) = cm.connections.get_mut(&self.quad) {
             let _ = c.close();
+        }
+        if let Some(n) = cm.streams.get_mut(&self.quad) {
+            *n -= 1;
+            if *n == 0 {
+                cm.streams.remove(&self.quad);
+            }
         }
     }
 }

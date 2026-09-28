@@ -57,8 +57,10 @@ EOF
       || { echo "FAIL: read did not error on RST"; kill $pid; exit 1; }
 
     # test 4: with every connection idle, the stack must stay silent
-    # (no periodic empty segments)
+    # (no periodic empty segments); n1 must be non-zero or the server
+    # never traced any write at all, which would make 0 == 0 vacuous
     n1=$(grep -c "^write(" /tmp/server.out)
+    [ "$n1" -gt 0 ] || { echo "FAIL: server produced no write() trace"; kill $pid; exit 1; }
     sleep 2
     n2=$(grep -c "^write(" /tmp/server.out)
     echo "idle write() calls: $n1 -> $n2"
