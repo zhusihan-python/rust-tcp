@@ -160,7 +160,7 @@ fn packet_loop(mut nic: Iface, ih: InterfaceHandle) -> io::Result<()> {
                     }
                 }
             }
-            Err(e) => {
+            Err(_e) => {
                 // eprintln!("ignoring weird packet {:?}", e);
             }
         }
@@ -223,7 +223,7 @@ impl Drop for TcpListener {
             .remove(&self.port)
             .expect("port closed while listener still active");
 
-        for quad in pending {
+        for _quad in pending {
             // TODO: terminate cm.connections[quad]
             unimplemented!();
         }
@@ -258,7 +258,7 @@ pub struct TcpStream {
 
 impl Drop for TcpStream {
     fn drop(&mut self) {
-        let cm = self.h.manager.lock().unwrap();
+        let _cm = self.h.manager.lock().unwrap();
         // TODO: send FIN on cm.connections[quad]
         // TODO: _eventually_ remove self.quad from cm.connections
     }
@@ -344,7 +344,7 @@ impl Write for TcpStream {
 }
 
 impl TcpStream {
-    pub fn shutdown(&self, how: std::net::Shutdown) -> io::Result<()> {
+    pub fn shutdown(&self, _how: std::net::Shutdown) -> io::Result<()> {
         let mut cm = self.h.manager.lock().unwrap();
         let c = cm.connections.get_mut(&self.quad).ok_or_else(|| {
             io::Error::new(

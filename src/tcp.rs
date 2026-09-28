@@ -23,6 +23,7 @@ enum State {
 }
 
 impl State {
+    #[allow(dead_code)] // for synchronized-state segment rules (RFC 793 S3.4), not yet wired up
     fn is_synchronized(&self) -> bool {
         match *self {
             State::SynRcvd => false,
@@ -79,7 +80,7 @@ impl Connection {
 
 /// State of the Send Sequence Space (RFC 793 S3.2 F4)
 ///
-/// ```
+/// ```text
 ///            1         2          3          4
 ///       ----------|----------|----------|----------
 ///              SND.UNA    SND.NXT    SND.UNA
@@ -98,10 +99,13 @@ struct SendSequenceSpace {
     /// send window
     wnd: u16,
     /// send urgent pointer
+    #[allow(dead_code)] // part of the RFC 793 send state, not yet wired up
     up: bool,
     /// segment sequence number used for last window update
+    #[allow(dead_code)] // for the window-update rules (RFC 793 S3.3), not yet wired up
     wl1: usize,
     /// segment acknowledgment number used for last window update
+    #[allow(dead_code)] // for the window-update rules (RFC 793 S3.3), not yet wired up
     wl2: usize,
     /// initial send sequence number
     iss: u32,
@@ -109,7 +113,7 @@ struct SendSequenceSpace {
 
 /// State of the Receive Sequence Space (RFC 793 S3.2 F5)
 ///
-/// ```
+/// ```text
 ///                1          2          3
 ///            ----------|----------|----------
 ///                   RCV.NXT    RCV.NXT
@@ -125,6 +129,7 @@ struct RecvSequenceSpace {
     /// receive window
     wnd: u16,
     /// receive urgent pointer
+    #[allow(dead_code)] // part of the RFC 793 receive state, not yet wired up
     up: bool,
     /// initial receive sequence number
     irs: u32,
@@ -135,9 +140,8 @@ impl Connection {
         nic: &mut Iface,
         iph: etherparse::Ipv4HeaderSlice<'a>,
         tcph: etherparse::TcpHeaderSlice<'a>,
-        data: &'a [u8],
+        _data: &'a [u8],
     ) -> io::Result<Option<Self>> {
-        let buf = [0u8; 1500];
         if !tcph.syn() {
             // only expected SYN packet
             return Ok(None);
@@ -240,15 +244,14 @@ impl Connection {
             buf.len(),
             self.tcp.header_len() as usize + self.ip.header_len() as usize + max_data,
         );
-        self.ip
-            .set_payload_len(size - self.ip.header_len() as usize);
+        let _ = self.ip.set_payload_len(size - self.ip.header_len() as usize);
 
         // write out the headers and the payload
         use std::io::Write;
         let buf_len = buf.len();
         let mut unwritten = &mut buf[..];
 
-        self.ip.write(&mut unwritten);
+        let _ = self.ip.write(&mut unwritten);
         let ip_header_ends_at = buf_len - unwritten.len();
 
         // postpone writing the tcp header because we need the payload as one contiguous slice to calculate the tcp checksum
@@ -279,7 +282,7 @@ impl Connection {
             .expect("failed to compute checksum");
 
         let mut tcp_header_buf = &mut buf[ip_header_ends_at..tcp_header_ends_at];
-        self.tcp.write(&mut tcp_header_buf);
+        let _ = self.tcp.write(&mut tcp_header_buf);
 
         let mut next_seq = seq.wrapping_add(payload_bytes as u32);
         if self.tcp.syn {
@@ -299,6 +302,7 @@ impl Connection {
         Ok(payload_bytes)
     }
 
+    #[allow(dead_code)] // will be wired to the RST paths noted in its TODOs
     fn send_rst(&mut self, nic: &mut Iface) -> io::Result<()> {
         self.tcp.rst = true;
         // TODO: fix sequence numbers here
@@ -382,7 +386,7 @@ impl Connection {
     pub(crate) fn on_packet<'a>(
         &mut self,
         nic: &mut Iface,
-        iph: etherparse::Ipv4HeaderSlice<'a>,
+        _iph: etherparse::Ipv4HeaderSlice<'a>,
         tcph: etherparse::TcpHeaderSlice<'a>,
         data: &'a [u8],
     ) -> io::Result<Available> {
@@ -476,7 +480,7 @@ impl Connection {
                     let old = std::mem::replace(&mut self.timers.send_times, BTreeMap::new());
 
                     let una = self.send.una;
-                    let mut srtt = &mut self.timers.srtt;
+                    let srtt = &mut self.timers.srtt;
                     self.timers
                         .send_times
                         .extend(old.into_iter().filter_map(|(seq, sent)| {
