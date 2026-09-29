@@ -16,9 +16,9 @@ docker run --rm --device /dev/net/tun --cap-add NET_ADMIN \
     apt-get update -qq
     apt-get install -y -qq --no-install-recommends iproute2 netcat-openbsd python3 > /dev/null
 
-    # the library tests, plus the root-only interface test (we are root here)
+    # the library tests, plus the root-only integration tests (we are root here)
     cargo test --release --quiet
-    cargo test --release --quiet --test interface_drop -- --ignored --nocapture
+    cargo test --release --quiet --test interface_drop --test blocking_write --test rst_semantics -- --ignored --nocapture
 
     cargo build --release
     $CARGO_TARGET_DIR/release/trust >/tmp/server.out 2>/tmp/server.log &
@@ -114,6 +114,41 @@ EOF
     else
       echo "NOTE: netem unavailable in this kernel; skipped loss test"
     fi
+
+    # test 6: a transfer much larger than the receive window with a draining
+    # reader must complete byte-exact — exercises window updates and the
+    # blocking/backpressure behavior of the send queue
+    if ! python3 - <<'EOF'
+import socket
+s = socket.create_connection(("192.168.0.2", 8000), timeout=60)
+# ASCII payload: the demo server reader println!s it as utf-8, so binary
+# data would (correctly) panic it and close the window
+lines = ("B6LINE%06d" % i for i in range(1024))
+data = "".join(l + "x" * (100 - len(l) - 1) + "\n" for l in lines)  # 102400 bytes
+s.sendall(data.encode())
+s.shutdown(socket.SHUT_WR)
+s.settimeout(60)
+while s.recv(4096):
+    pass
+s.close()
+EOF
+    then
+      echo "FAIL: large transfer client"
+      ss -tan 2>/dev/null | head -8
+      tc qdisc show dev tun0 2>/dev/null
+      tail -8 /tmp/server.log
+      kill $pid
+      exit 1
+    fi
+    got=0
+    for _ in $(seq 1 30); do
+      # 5 + 8000 + 102400 bytes total must have been read
+      got=$(grep -o "read [0-9]*b of data" /tmp/server.log | grep -o "[0-9]*" | awk "{s+=\$1} END{print s+0}")
+      [ "$got" -eq 110405 ] && break
+      sleep 2
+    done
+    echo "large transfer: $got/110405 bytes"
+    [ "$got" -eq 110405 ] || { echo "FAIL: large transfer incomplete"; tail -8 /tmp/server.log; kill $pid; exit 1; }
 
     kill $pid 2>/dev/null || true
     echo "ALL LINUX TESTS PASSED"

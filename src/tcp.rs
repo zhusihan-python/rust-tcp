@@ -46,6 +46,14 @@ impl State {
 /// FIN retransmissions; shortened here so the reclamation is observable.
 const TIME_WAIT: time::Duration = time::Duration::from_secs(10);
 
+/// Receive buffer size; the window we advertise is the unused part of it.
+const RECV_BUFFER: usize = 4096;
+
+/// How long to wait for the peer's FIN after ours has been acknowledged
+/// before giving up on the connection. Real stacks wait minutes; shortened
+/// so the reclamation is observable.
+const FIN_WAIT2_TIMEOUT: time::Duration = time::Duration::from_secs(30);
+
 pub struct Connection {
     state: State,
     send: SendSequenceSpace,
@@ -60,8 +68,11 @@ pub struct Connection {
     pub(crate) closed: bool,
     closed_at: Option<u32>,
     entered_timewait: Option<time::Instant>,
+    entered_finwait2: Option<time::Instant>,
     /// set when the peer sent a RST; reads and writes must fail, not see EOF
     pub(crate) reset: bool,
+    /// set when the application shut down its read side
+    pub(crate) rcv_shutdown: bool,
 }
 
 struct Timers {
@@ -71,7 +82,11 @@ struct Timers {
 
 impl Connection {
     pub(crate) fn is_rcv_closed(&self) -> bool {
-        // any state after having received the peer's FIN
+        // the application shut down its read side, or any state after
+        // having received the peer's FIN
+        if self.rcv_shutdown {
+            return true;
+        }
         if let State::TimeWait | State::CloseWait | State::Closing | State::LastAck | State::Closed =
             self.state
         {
@@ -79,6 +94,13 @@ impl Connection {
         } else {
             false
         }
+    }
+
+    /// half-close the receive side: further data from the peer is still
+    /// acknowledged but discarded, and reads return EOF immediately
+    pub(crate) fn shutdown_read(&mut self) {
+        self.rcv_shutdown = true;
+        self.incoming.clear();
     }
 
     /// the connection is fully closed and can be reclaimed by the packet loop
@@ -104,8 +126,12 @@ impl Connection {
         if self.reset || self.is_rcv_closed() || !self.incoming.is_empty() {
             a |= Available::READ;
         }
+        // there is room for more outgoing data, or the connection has
+        // failed — either way a blocked writer should re-check
+        if self.reset || self.unacked.len() < crate::SENDQUEUE_SIZE {
+            a |= Available::WRITE;
+        }
         // TODO: take into account self.state
-        // TODO: set Available::WRITE
         a
     }
 }
@@ -134,11 +160,9 @@ struct SendSequenceSpace {
     #[allow(dead_code)] // part of the RFC 793 send state, not yet wired up
     up: bool,
     /// segment sequence number used for last window update
-    #[allow(dead_code)] // for the window-update rules (RFC 793 S3.3), not yet wired up
-    wl1: usize,
+    wl1: u32,
     /// segment acknowledgment number used for last window update
-    #[allow(dead_code)] // for the window-update rules (RFC 793 S3.3), not yet wired up
-    wl2: usize,
+    wl2: u32,
     /// initial send sequence number
     iss: u32,
 }
@@ -180,7 +204,9 @@ impl Connection {
         }
 
         let iss = 0;
-        let wnd = 1024;
+        // our advertised receive window starts as the full receive buffer;
+        // it is recomputed from `incoming` on every outgoing segment
+        let wnd = RECV_BUFFER as u16;
         let mut c = Connection {
             timers: Timers {
                 send_times: Default::default(),
@@ -194,7 +220,9 @@ impl Connection {
                 iss,
                 una: iss,
                 nxt: iss,
-                wnd: wnd,
+                // the peer's advertised window — how much we may send —
+                // updated from ACKs per the SND.WL1/WL2 rules
+                wnd: tcph.window_size(),
                 up: false,
 
                 wl1: 0,
@@ -203,7 +231,7 @@ impl Connection {
             recv: RecvSequenceSpace {
                 irs: tcph.sequence_number(),
                 nxt: tcph.sequence_number() + 1,
-                wnd: tcph.window_size(),
+                wnd: wnd,
                 up: false,
             },
             tcp: etherparse::TcpHeader::new(tcph.destination_port(), tcph.source_port(), iss, wnd),
@@ -231,7 +259,9 @@ impl Connection {
             closed: false,
             closed_at: None,
             entered_timewait: None,
+            entered_finwait2: None,
             reset: false,
+            rcv_shutdown: false,
         };
 
         // need to start establishing a connection
@@ -245,6 +275,13 @@ impl Connection {
         let mut buf = [0u8; 1500];
         self.tcp.sequence_number = seq;
         self.tcp.acknowledgment_number = self.recv.nxt;
+
+        // advertise the unused part of the receive buffer as our window
+        // (RCV.WND, RFC 793 S3.1); the sequence-space check uses the same
+        // value, so acceptance and advertisement cannot disagree
+        let space = RECV_BUFFER.saturating_sub(self.incoming.len());
+        self.recv.wnd = space as u16;
+        self.tcp.window_size = space as u16;
 
         // TODO: return +1 for SYN/FIN
         println!(
@@ -365,8 +402,16 @@ impl Connection {
 
     pub(crate) fn on_tick(&mut self, nic: &mut Iface) -> io::Result<Available> {
         if let State::FinWait2 = self.state {
-            // we have shutdown our write side and the other side acked, no need to (re)transmit anything
-            // TODO: time out and reclaim if the peer never sends its FIN
+            // we have shutdown our write side and the other side acked, no
+            // need to (re)transmit anything. If the peer never sends its
+            // FIN, give up on the connection after the timeout above.
+            if self
+                .entered_finwait2
+                .map(|t| t.elapsed() > FIN_WAIT2_TIMEOUT)
+                .unwrap_or(false)
+            {
+                self.state = State::Closed;
+            }
             return Ok(self.availability());
         }
 
@@ -445,7 +490,9 @@ impl Connection {
                 return Ok(self.availability());
             }
 
-            let allowed = self.send.wnd as u32 - nunacked_data;
+            // saturating: the peer may have shrunk its window below what we
+            // already have in flight; send nothing new until it opens again
+            let allowed = (self.send.wnd as u32).saturating_sub(nunacked_data);
             if allowed == 0 {
                 return Ok(self.availability());
             }
@@ -606,6 +653,16 @@ impl Connection {
                 self.send.una = ackn;
             }
 
+            // update the send window from this ACK (RFC 793 S3.3):
+            // SEG.SEQ > SND.WL1, or SEG.SEQ == SND.WL1 and SEG.ACK >= SND.WL2
+            if wrapping_lt(self.send.wl1, seqn)
+                || (seqn == self.send.wl1 && !wrapping_lt(ackn, self.send.wl2))
+            {
+                self.send.wnd = tcph.window_size();
+                self.send.wl1 = seqn;
+                self.send.wl2 = ackn;
+            }
+
             // TODO: if unacked empty and waiting flush, notify
             // TODO: update window
         }
@@ -615,6 +672,7 @@ impl Connection {
                 if self.send.una == closed_at.wrapping_add(1) {
                     // our FIN has been ACKed!
                     self.state = State::FinWait2;
+                    self.entered_finwait2 = Some(time::Instant::now());
                 }
             }
         }
@@ -792,7 +850,9 @@ mod tests {
             closed: false,
             closed_at: None,
             entered_timewait: None,
+            entered_finwait2: None,
             reset: false,
+            rcv_shutdown: false,
         }
     }
 
@@ -898,6 +958,19 @@ mod tests {
         assert!(matches!(c.state, State::Closed));
         assert!(c.reset);
         assert!(c.is_done());
+        assert!(c.is_rcv_closed());
+    }
+
+    #[test]
+    fn shutdown_read_closes_rcv_side_and_discards() {
+        let mut c = conn_in(State::Estab);
+        c.incoming.extend(b"abc".iter());
+        assert!(!c.is_rcv_closed());
+        c.shutdown_read();
+        assert!(c.is_rcv_closed());
+        assert!(c.incoming.is_empty());
+        // idempotent
+        c.shutdown_read();
         assert!(c.is_rcv_closed());
     }
 

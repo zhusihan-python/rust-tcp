@@ -28,6 +28,7 @@ struct Foobar {
     manager: Mutex<ConnectionManager>,
     pending_var: Condvar,
     rcv_var: Condvar,
+    snd_var: Condvar,
 }
 
 type InterfaceHandle = Arc<Foobar>;
@@ -109,8 +110,10 @@ fn packet_loop(mut nic: Iface, ih: InterfaceHandle) -> io::Result<()> {
                 }
             }
             if errored {
-                // wake readers of aborted connections so they see the error
+                // wake readers and writers of aborted connections so they
+                // see the error
                 ih.rcv_var.notify_all();
+                ih.snd_var.notify_all();
             }
             // reclaim fully-closed connections (post-TIME-WAIT, LAST-ACK or
             // abort), but only once no stream handle still references them
@@ -168,13 +171,13 @@ fn packet_loop(mut nic: Iface, ih: InterfaceHandle) -> io::Result<()> {
                         match cm.connections.entry(q) {
                             Entry::Occupied(mut c) => {
                                 eprintln!("got packet for known quad {:?}", q);
-                                let a = match c.get_mut().on_packet(
+                                match c.get_mut().on_packet(
                                     &mut nic,
                                     iph,
                                     tcph,
                                     &buf[datai..nbytes],
                                 ) {
-                                    Ok(a) => a,
+                                    Ok(_) => {}
                                     Err(e) => {
                                         // one sick connection must not take down the whole stack
                                         eprintln!(
@@ -184,18 +187,18 @@ fn packet_loop(mut nic: Iface, ih: InterfaceHandle) -> io::Result<()> {
                                         c.get_mut().abort();
                                         drop(cmg);
                                         ih.rcv_var.notify_all();
+                                        ih.snd_var.notify_all();
                                         continue;
                                     }
                                 };
 
-                                // TODO: compare before/after
+                                // wake blocked readers and writers; they re-check their
+                                // own conditions, so spurious wakeups are fine — and
+                                // resets/aborts must wake writers even without an
+                                // availability transition
                                 drop(cmg);
-                                if a.contains(tcp::Available::READ) {
-                                    ih.rcv_var.notify_all()
-                                }
-                                if a.contains(tcp::Available::WRITE) {
-                                    // TODO: ih.snd_var.notify_all()
-                                }
+                                ih.rcv_var.notify_all();
+                                ih.snd_var.notify_all();
                             }
                             Entry::Vacant(e) => {
                                 eprintln!("got packet for unknown quad {:?}", q);
@@ -388,65 +391,65 @@ impl Read for TcpStream {
 
 impl Write for TcpStream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
         let mut cm = self.h.manager.lock().unwrap();
-        let c = cm.connections.get_mut(&self.quad).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::ConnectionAborted,
-                "stream was terminated unexpectedly",
-            )
-        })?;
+        loop {
+            let c = cm.connections.get_mut(&self.quad).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "stream was terminated unexpectedly",
+                )
+            })?;
 
-        if c.reset {
-            return Err(io::Error::new(
-                io::ErrorKind::ConnectionReset,
-                "connection reset by peer",
-            ));
+            if c.reset {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    "connection reset by peer",
+                ));
+            }
+
+            if c.unacked.len() < SENDQUEUE_SIZE {
+                let nwrite = std::cmp::min(buf.len(), SENDQUEUE_SIZE - c.unacked.len());
+                c.unacked.extend(buf[..nwrite].iter());
+                return Ok(nwrite);
+            }
+
+            // the send queue is full: wait for ACKs to drain it
+            cm = self.h.snd_var.wait(cm).unwrap();
         }
-
-        if c.unacked.len() >= SENDQUEUE_SIZE {
-            // TODO: block
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "too many bytes buffered",
-            ));
-        }
-
-        let nwrite = std::cmp::min(buf.len(), SENDQUEUE_SIZE - c.unacked.len());
-        c.unacked.extend(buf[..nwrite].iter());
-
-        Ok(nwrite)
     }
 
     fn flush(&mut self) -> io::Result<()> {
         let mut cm = self.h.manager.lock().unwrap();
-        let c = cm.connections.get_mut(&self.quad).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::ConnectionAborted,
-                "stream was terminated unexpectedly",
-            )
-        })?;
+        loop {
+            let c = cm.connections.get_mut(&self.quad).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "stream was terminated unexpectedly",
+                )
+            })?;
 
-        if c.reset {
-            return Err(io::Error::new(
-                io::ErrorKind::ConnectionReset,
-                "connection reset by peer",
-            ));
-        }
+            if c.reset {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    "connection reset by peer",
+                ));
+            }
 
-        if c.unacked.is_empty() {
-            Ok(())
-        } else {
-            // TODO: block
-            Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "too many bytes buffered",
-            ))
+            if c.unacked.is_empty() {
+                return Ok(());
+            }
+
+            // wait until everything queued has been acknowledged
+            cm = self.h.snd_var.wait(cm).unwrap();
         }
     }
 }
 
 impl TcpStream {
-    pub fn shutdown(&self, _how: std::net::Shutdown) -> io::Result<()> {
+    pub fn shutdown(&self, how: std::net::Shutdown) -> io::Result<()> {
         let mut cm = self.h.manager.lock().unwrap();
         let c = cm.connections.get_mut(&self.quad).ok_or_else(|| {
             io::Error::new(
@@ -462,6 +465,20 @@ impl TcpStream {
             ));
         }
 
-        c.close()
+        let r = match how {
+            std::net::Shutdown::Read => {
+                c.shutdown_read();
+                Ok(())
+            }
+            std::net::Shutdown::Write => c.close(),
+            std::net::Shutdown::Both => {
+                c.shutdown_read();
+                c.close()
+            }
+        };
+        drop(cm);
+        // a blocked reader must observe the read-side shutdown
+        self.h.rcv_var.notify_all();
+        r
     }
 }
