@@ -295,10 +295,13 @@ impl Drop for TcpListener {
             .expect("port closed while listener still active");
 
         for quad in pending {
-            // the streams for these quads are going away with the listener;
-            // abandon the connections rather than wait for a close handshake
-            // TODO: send RST via cm.connections[quad] so the peer finds out now
-            cm.connections.remove(&quad);
+            // the connections for these quads were never accepted by the
+            // application and are going away with the listener: ask the
+            // packet loop to reset the peer (only it holds the interface);
+            // after the RST the connection is reclaimed
+            if let Some(c) = cm.connections.get_mut(&quad) {
+                c.send_reset = true;
+            }
         }
     }
 }

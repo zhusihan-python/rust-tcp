@@ -73,6 +73,9 @@ pub struct Connection {
     pub(crate) reset: bool,
     /// set when the application shut down its read side
     pub(crate) rcv_shutdown: bool,
+    /// set by a dropped listener that abandoned this connection; the packet
+    /// loop sends the RST on the next tick (only it holds the interface)
+    pub(crate) send_reset: bool,
 }
 
 struct Timers {
@@ -262,6 +265,7 @@ impl Connection {
             entered_finwait2: None,
             reset: false,
             rcv_shutdown: false,
+            send_reset: false,
         };
 
         // need to start establishing a connection
@@ -311,6 +315,10 @@ impl Connection {
             self.unacked.as_slices()
         );
         let (mut h, mut t) = self.unacked.as_slices();
+        // a reset may carry a sequence number far beyond anything queued
+        // (e.g. an offending segment ACK number); clamp so the slicing
+        // below cannot go out of range (the payload is empty anyway)
+        let offset = std::cmp::min(offset, h.len() + t.len());
         if h.len() >= offset {
             h = &h[offset..];
         } else {
@@ -382,31 +390,32 @@ impl Connection {
         Ok(payload_bytes)
     }
 
-    #[allow(dead_code)] // will be wired to the RST paths noted in its TODOs
-    fn send_rst(&mut self, nic: &mut Iface) -> io::Result<()> {
+    /// Send a RST (RFC 793 S3.4 "reset generation"). `seq` is the sequence
+    /// number the reset carries: the ACK number of the offending segment
+    /// when it had one (the RFC's case 1), or SND.NXT for an abort-style
+    /// reset. A reset never carries the ACK flag; the flags are restored
+    /// afterwards so later segments are built normally.
+    fn send_rst(&mut self, nic: &mut Iface, seq: u32) -> io::Result<()> {
         self.tcp.rst = true;
-        // TODO: fix sequence numbers here
-        // If the incoming segment has an ACK field, the reset takes its
-        // sequence number from the ACK field of the segment, otherwise the
-        // reset has sequence number zero and the ACK field is set to the sum
-        // of the sequence number and segment length of the incoming segment.
-        // The connection remains in the same state.
-        //
-        // TODO: handle synchronized RST
-        // 3.  If the connection is in a synchronized state (ESTABLISHED,
-        // FIN-WAIT-1, FIN-WAIT-2, CLOSE-WAIT, CLOSING, LAST-ACK, TIME-WAIT),
-        // any unacceptable segment (out of window sequence number or
-        // unacceptible acknowledgment number) must elicit only an empty
-        // acknowledgment segment containing the current send-sequence number
-        // and an acknowledgment indicating the next sequence number expected
-        // to be received, and the connection remains in the same state.
-        self.tcp.sequence_number = 0;
-        self.tcp.acknowledgment_number = 0;
-        self.write(nic, self.send.nxt, 0)?;
+        self.tcp.ack = false;
+        let r = self.write(nic, seq, 0);
+        self.tcp.rst = false;
+        self.tcp.ack = true;
+        r?;
         Ok(())
     }
 
     pub(crate) fn on_tick(&mut self, nic: &mut Iface) -> io::Result<Available> {
+        if self.send_reset {
+            // deferred by a listener that abandoned this connection before
+            // the application ever saw it: tell the peer now (abort-style
+            // reset, SEQ = SND.NXT) instead of letting it time out
+            eprintln!("sending deferred RST for abandoned connection");
+            self.send_rst(nic, self.send.nxt)?;
+            self.state = State::Closed;
+            return Ok(self.availability());
+        }
+
         if let State::FinWait2 = self.state {
             // we have shutdown our write side and the other side acked, no
             // need to (re)transmit anything. If the peer never sends its
@@ -577,7 +586,11 @@ impl Connection {
                     return Ok(self.availability());
                 }
             }
-            self.write(nic, self.send.nxt, 0)?;
+            // RFC 793 S3.4 #3: in a synchronized state, an unacceptable
+            // segment elicits only an empty ACK (state unchanged)
+            if self.state.is_synchronized() || matches!(self.state, State::SynRcvd) {
+                self.write(nic, self.send.nxt, 0)?;
+            }
             return Ok(self.availability());
         }
 
@@ -615,7 +628,13 @@ impl Connection {
                 // and we have only sent one byte (the SYN).
                 self.state = State::Estab;
             } else {
-                // TODO: <SEQ=SEG.ACK><CTL=RST>
+                // RFC 793 S3.4: an ACK that does not acknowledge our SYN is
+                // answered with a reset whose sequence number is the
+                // segment ACK number; the half-open connection is discarded
+                eprintln!("unacceptable ACK in SYN-RCVD; resetting");
+                self.send_rst(nic, ackn)?;
+                self.abort();
+                return Ok(self.availability());
             }
         }
 
@@ -871,6 +890,7 @@ mod tests {
             entered_finwait2: None,
             reset: false,
             rcv_shutdown: false,
+            send_reset: false,
         }
     }
 

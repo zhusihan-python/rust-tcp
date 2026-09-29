@@ -14,16 +14,16 @@ docker run --rm --device /dev/net/tun --cap-add NET_ADMIN \
   rust:1-slim bash -eux -c '
     [ -e /dev/net/tun ] || mknod /dev/net/tun c 10 200
     apt-get update -qq
-    apt-get install -y -qq --no-install-recommends iproute2 netcat-openbsd python3 > /dev/null
+    apt-get install -y -qq --no-install-recommends iproute2 iptables netcat-openbsd python3 python3-scapy > /dev/null
     # fail loudly if apt silently failed: a missing tool otherwise surfaces
     # later as phantom symptoms (e.g. SYNs that never reach the stack)
-    for tool in ip tc nc python3; do
+    for tool in ip tc iptables nc python3; do
       command -v $tool > /dev/null || { echo "FAIL: $tool missing after apt install"; exit 1; }
     done
 
     # the library tests, plus the root-only integration tests (we are root here)
     cargo test --release --quiet
-    cargo test --release --quiet --test interface_drop --test blocking_write --test rst_semantics --test shutdown_read_semantics -- --ignored --nocapture
+    cargo test --release --quiet --test interface_drop --test blocking_write --test rst_semantics --test shutdown_read_semantics --test listener_drop_rst --test synrcvd_reset -- --ignored --nocapture
 
     cargo build --release
     $CARGO_TARGET_DIR/release/trust >/tmp/server.out 2>/tmp/server.log &
@@ -154,6 +154,13 @@ EOF
     done
     echo "large transfer: $got/110405 bytes"
     [ "$got" -eq 110405 ] || { echo "FAIL: large transfer incomplete"; tail -8 /tmp/server.log; kill $pid; exit 1; }
+
+    # test 7 (SYN-RCVD reset form against a never-accepting listener) runs
+    # as the root-only integration test synrcvd_reset above: the demo
+    # server would race the connection out of SYN-RCVD before the probe
+
+    kill $pid 2>/dev/null || true
+    echo "ALL LINUX TESTS PASSED"
 
     kill $pid 2>/dev/null || true
     echo "ALL LINUX TESTS PASSED"
