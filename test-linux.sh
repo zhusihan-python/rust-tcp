@@ -18,7 +18,7 @@ docker run --rm --device /dev/net/tun --cap-add NET_ADMIN \
 
     # the library tests, plus the root-only integration tests (we are root here)
     cargo test --release --quiet
-    cargo test --release --quiet --test interface_drop --test blocking_write --test rst_semantics -- --ignored --nocapture
+    cargo test --release --quiet --test interface_drop --test blocking_write --test rst_semantics --test shutdown_read_semantics -- --ignored --nocapture
 
     cargo build --release
     $CARGO_TARGET_DIR/release/trust >/tmp/server.out 2>/tmp/server.log &

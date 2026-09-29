@@ -278,7 +278,13 @@ impl Connection {
 
         // advertise the unused part of the receive buffer as our window
         // (RCV.WND, RFC 793 S3.1); the sequence-space check uses the same
-        // value, so acceptance and advertisement cannot disagree
+        // value, so acceptance and advertisement cannot disagree.
+        //
+        // NOTE: we never send spontaneous window updates (no persist timer);
+        // when we advertise 0 and the application later drains `incoming`,
+        // it is the peer's zero-window probes — which fail the sequence
+        // check and land in the bare-ACK path — that re-open the window
+        // through this recomputation
         let space = RECV_BUFFER.saturating_sub(self.incoming.len());
         self.recv.wnd = space as u16;
         self.tcp.window_size = space as u16;
@@ -653,8 +659,12 @@ impl Connection {
                 self.send.una = ackn;
             }
 
-            // update the send window from this ACK (RFC 793 S3.3):
-            // SEG.SEQ > SND.WL1, or SEG.SEQ == SND.WL1 and SEG.ACK >= SND.WL2
+            // update the send window per RFC 793 S3.3: SEG.SEQ > SND.WL1, or
+            // SEG.SEQ == SND.WL1 and SEG.ACK >= SND.WL2. This must NOT be
+            // gated on SEG.ACK advancing SND.UNA: a pure window update
+            // (SEG.ACK == SND.UNA with a larger window) is exactly how a
+            // peer re-opens a zero window, and the WL1/WL2 comparison above
+            // is what rejects stale duplicates
             if wrapping_lt(self.send.wl1, seqn)
                 || (seqn == self.send.wl1 && !wrapping_lt(ackn, self.send.wl2))
             {
@@ -662,9 +672,6 @@ impl Connection {
                 self.send.wl1 = seqn;
                 self.send.wl2 = ackn;
             }
-
-            // TODO: if unacked empty and waiting flush, notify
-            // TODO: update window
         }
 
         if let State::FinWait1 = self.state {
@@ -698,37 +705,45 @@ impl Connection {
 
         if !data.is_empty() {
             if let State::Estab | State::FinWait1 | State::FinWait2 = self.state {
-                if wrapping_lt(self.recv.nxt, seqn) {
-                    // out-of-order segment: a gap of unreceived data
-                    // precedes it. Buffer nothing and never advance RCV.NXT
-                    // across the gap — re-ACK the left edge (dup-ACK) so the
-                    // peer retransmits what is missing. Without this, the
-                    // ACK would take credit for the missing bytes and they
-                    // would be lost silently.
-                    self.write(nic, self.send.nxt, 0)?;
-                    return Ok(self.availability());
-                }
+                if self.rcv_shutdown {
+                    // our read side is shut: the peer cannot know and keeps
+                    // sending. Take responsibility for the data (RCV.NXT
+                    // advances, the segment is ACKed, the window stays open)
+                    // but discard it — reads must keep returning EOF
+                    self.recv.nxt = seqn.wrapping_add(data.len() as u32);
+                } else {
+                    if wrapping_lt(self.recv.nxt, seqn) {
+                        // out-of-order segment: a gap of unreceived data
+                        // precedes it. Buffer nothing and never advance RCV.NXT
+                        // across the gap — re-ACK the left edge (dup-ACK) so the
+                        // peer retransmits what is missing. Without this, the
+                        // ACK would take credit for the missing bytes and they
+                        // would be lost silently.
+                        self.write(nic, self.send.nxt, 0)?;
+                        return Ok(self.availability());
+                    }
 
-                let mut unread_data_at = self.recv.nxt.wrapping_sub(seqn) as usize;
-                if unread_data_at > data.len() {
-                    // a fully-consumed retransmission: a later segment already
-                    // advanced RCV.NXT past this segment's data, so nothing
-                    // in here is new
-                    unread_data_at = data.len();
-                }
-                self.incoming.extend(&data[unread_data_at..]);
+                    let mut unread_data_at = self.recv.nxt.wrapping_sub(seqn) as usize;
+                    if unread_data_at > data.len() {
+                        // a fully-consumed retransmission: a later segment
+                        // already advanced RCV.NXT past this segment's data,
+                        // so nothing in here is new
+                        unread_data_at = data.len();
+                    }
+                    self.incoming.extend(&data[unread_data_at..]);
 
-                /*
-                Once the TCP takes responsibility for the data it advances
-                RCV.NXT over the data accepted, and adjusts RCV.WND as
-                apporopriate to the current buffer availability.  The total of
-                RCV.NXT and RCV.WND should not be reduced.
-                 */
-                let new_nxt = seqn.wrapping_add(data.len() as u32);
-                if wrapping_lt(self.recv.nxt, new_nxt) {
-                    // never move RCV.NXT backwards (fully-consumed
-                    // retransmissions must not rewind it)
-                    self.recv.nxt = new_nxt;
+                    /*
+                    Once the TCP takes responsibility for the data it advances
+                    RCV.NXT over the data accepted, and adjusts RCV.WND as
+                    apporopriate to the current buffer availability.  The total of
+                    RCV.NXT and RCV.WND should not be reduced.
+                     */
+                    let new_nxt = seqn.wrapping_add(data.len() as u32);
+                    if wrapping_lt(self.recv.nxt, new_nxt) {
+                        // never move RCV.NXT backwards (fully-consumed
+                        // retransmissions must not rewind it)
+                        self.recv.nxt = new_nxt;
+                    }
                 }
 
                 // Send an acknowledgment of the form: <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>

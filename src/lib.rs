@@ -366,6 +366,12 @@ impl Read for TcpStream {
                 ));
             }
 
+            if c.rcv_shutdown {
+                // the read side is shut down: EOF no matter what the peer
+                // keeps sending (it cannot know we stopped reading)
+                return Ok(0);
+            }
+
             if c.is_rcv_closed() && c.incoming.is_empty() {
                 // no more data to read, and no need to block, because there won't be any more
                 return Ok(0);
