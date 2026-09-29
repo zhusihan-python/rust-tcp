@@ -161,7 +161,4 @@ EOF
 
     kill $pid 2>/dev/null || true
     echo "ALL LINUX TESTS PASSED"
-
-    kill $pid 2>/dev/null || true
-    echo "ALL LINUX TESTS PASSED"
   '

@@ -25,7 +25,8 @@ enum State {
 }
 
 impl State {
-    #[allow(dead_code)] // for synchronized-state segment rules (RFC 793 S3.3), not yet wired up
+    #[allow(dead_code)] // kept as an RFC 793 S3.4 reference helper; nothing
+    // currently branches on it (segment rules are state-independent here)
     fn is_synchronized(&self) -> bool {
         match *self {
             State::SynRcvd => false,
@@ -586,11 +587,11 @@ impl Connection {
                     return Ok(self.availability());
                 }
             }
-            // RFC 793 S3.4 #3: in a synchronized state, an unacceptable
-            // segment elicits only an empty ACK (state unchanged)
-            if self.state.is_synchronized() || matches!(self.state, State::SynRcvd) {
-                self.write(nic, self.send.nxt, 0)?;
-            }
+            // RFC 793 S3.9 segment-arrival step 1: an unacceptable segment
+            // is answered with an empty ACK and dropped, whatever the state
+            // (the "synchronized state" phrasing in S3.4 #3 scopes the RST
+            // rules, not this response)
+            self.write(nic, self.send.nxt, 0)?;
             return Ok(self.availability());
         }
 
