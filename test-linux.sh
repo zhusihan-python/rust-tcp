@@ -15,6 +15,11 @@ docker run --rm --device /dev/net/tun --cap-add NET_ADMIN \
     [ -e /dev/net/tun ] || mknod /dev/net/tun c 10 200
     apt-get update -qq
     apt-get install -y -qq --no-install-recommends iproute2 netcat-openbsd python3 > /dev/null
+    # fail loudly if apt silently failed: a missing tool otherwise surfaces
+    # later as phantom symptoms (e.g. SYNs that never reach the stack)
+    for tool in ip tc nc python3; do
+      command -v $tool > /dev/null || { echo "FAIL: $tool missing after apt install"; exit 1; }
+    done
 
     # the library tests, plus the root-only integration tests (we are root here)
     cargo test --release --quiet

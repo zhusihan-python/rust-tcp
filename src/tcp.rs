@@ -709,7 +709,10 @@ impl Connection {
                     // our read side is shut: the peer cannot know and keeps
                     // sending. Take responsibility for the data (RCV.NXT
                     // advances, the segment is ACKed, the window stays open)
-                    // but discard it — reads must keep returning EOF
+                    // but discard it — reads must keep returning EOF.
+                    // No never-backwards guard needed here: the okay gate
+                    // already filtered fully-old segments, and a non-empty
+                    // segment with seqn >= RCV.NXT - 1 cannot land below it
                     self.recv.nxt = seqn.wrapping_add(data.len() as u32);
                 } else {
                     if wrapping_lt(self.recv.nxt, seqn) {
