@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  # Library and unit tests. Runs in the same container image test-linux.sh
+  # pins, so the two jobs see one toolchain. The root-only integration tests
+  # are #[ignore]d here; they run in the linux-e2e job below.
+  unit:
+    runs-on: ubuntu-latest
+    container:
+      image: rust:1-slim
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo test --release --quiet
+
+  # Full userspace-TCP end-to-end suite over a real tun device inside Docker:
+  # plain connectivity, TIME-WAIT reclamation, RST handling, idle silence, a
+  # lossy netem link, and an over-window transfer, plus the root-only
+  # integration tests (scapy-level RST assertions, listener teardown, ...).
+  linux-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./test-linux.sh
