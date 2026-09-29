@@ -184,7 +184,10 @@ impl Connection {
         let mut c = Connection {
             timers: Timers {
                 send_times: Default::default(),
-                srtt: time::Duration::from_secs(1 * 60).as_secs_f64(),
+                // start at the retransmit floor: a huge initial estimate
+                // (this used to be 60s) makes the first loss on every
+                // connection wait ~1.5x that before retransmitting
+                srtt: time::Duration::from_secs(1).as_secs_f64(),
             },
             state: State::SynRcvd,
             send: SendSequenceSpace {
@@ -428,6 +431,11 @@ impl Connection {
                 self.tcp.fin = true;
                 self.closed_at = Some(self.send.una.wrapping_add(self.unacked.len() as u32));
             }
+            if self.send.una == self.send.iss {
+                // what we are retransmitting is our unacknowledged SYN;
+                // write() cleared the flag after the first transmission
+                self.tcp.syn = true;
+            }
             self.write(nic, self.send.una, resend as usize)?;
         } else {
             // we should send new data if we have new data and space in the window
@@ -501,7 +509,21 @@ impl Connection {
         };
 
         if !okay {
+            if tcph.rst() {
+                // RFC 793 S3.4: a RST outside the window is silently discarded
+                return Ok(self.availability());
+            }
             eprintln!("NOT OKAY");
+            if let State::SynRcvd = self.state {
+                if tcph.syn() && seqn == self.recv.irs {
+                    // the peer is retransmitting its SYN because our SYN-ACK
+                    // was lost: resend the SYN-ACK (write() cleared the SYN
+                    // flag after the first transmission)
+                    self.tcp.syn = true;
+                    self.write(nic, self.send.iss, 0)?;
+                    return Ok(self.availability());
+                }
+            }
             self.write(nic, self.send.nxt, 0)?;
             return Ok(self.availability());
         }
@@ -515,6 +537,7 @@ impl Connection {
             // synchronized states; in SYN-RCVD the RFC would check RST
             // first — an accepted simplification in this stack.
             eprintln!("got RST; aborting connection");
+            self.incoming.clear();
             self.abort();
             return Ok(self.availability());
         }
@@ -617,6 +640,17 @@ impl Connection {
 
         if !data.is_empty() {
             if let State::Estab | State::FinWait1 | State::FinWait2 = self.state {
+                if wrapping_lt(self.recv.nxt, seqn) {
+                    // out-of-order segment: a gap of unreceived data
+                    // precedes it. Buffer nothing and never advance RCV.NXT
+                    // across the gap — re-ACK the left edge (dup-ACK) so the
+                    // peer retransmits what is missing. Without this, the
+                    // ACK would take credit for the missing bytes and they
+                    // would be lost silently.
+                    self.write(nic, self.send.nxt, 0)?;
+                    return Ok(self.availability());
+                }
+
                 let mut unread_data_at = self.recv.nxt.wrapping_sub(seqn) as usize;
                 if unread_data_at > data.len() {
                     // a fully-consumed retransmission: a later segment already
@@ -878,6 +912,7 @@ mod tests {
         let mut c = conn_in(State::SynRcvd);
         c.close().unwrap();
         assert!(matches!(c.state, State::FinWait1));
+        assert!(c.closed);
 
         // passive close
         let mut c = conn_in(State::CloseWait);

@@ -42,11 +42,12 @@ docker run --rm --device /dev/net/tun --cap-add NET_ADMIN \
       || { echo "FAIL: connection not reclaimed"; kill $pid; exit 1; }
 
     # test 3: an aborted client (SO_LINGER 0 => RST) must fail the server
-    # reads with an error instead of hanging or reporting clean EOF
+    # reads with an error instead of hanging or reporting clean EOF. No data
+    # is sent: a reset legitimately discards received-but-unread bytes, so a
+    # ping here would make the byte accounting of test 5 racy.
     python3 - <<EOF
 import socket, struct
 s = socket.create_connection(("192.168.0.2", 8000), timeout=5)
-s.sendall(b"ping\n")
 s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
 s.close()
 EOF
@@ -56,15 +57,63 @@ EOF
     grep -q "connection reset by peer" /tmp/server.log \
       || { echo "FAIL: read did not error on RST"; kill $pid; exit 1; }
 
-    # test 4: with every connection idle, the stack must stay silent
-    # (no periodic empty segments); n1 must be non-zero or the server
-    # never traced any write at all, which would make 0 == 0 vacuous
+    # test 4: with a connection parked idle in the connection map (its
+    # server-side reader is blocked, so it is never reclaimed) the stack
+    # must stay silent — no periodic empty segments. n1 must be non-zero
+    # or the server never traced any write at all.
+    python3 - <<'EOF' &
+import socket, time
+s = socket.create_connection(("192.168.0.2", 8000), timeout=5)
+time.sleep(8)
+EOF
+    idle=$!
+    sleep 1
     n1=$(grep -c "^write(" /tmp/server.out)
     [ "$n1" -gt 0 ] || { echo "FAIL: server produced no write() trace"; kill $pid; exit 1; }
     sleep 2
     n2=$(grep -c "^write(" /tmp/server.out)
     echo "idle write() calls: $n1 -> $n2"
     [ "$n1" -eq "$n2" ] || { echo "FAIL: transmitting while idle"; kill $pid; exit 1; }
+    wait $idle || true
+
+    # test 5: on a lossy, reordering link, a multi-segment stream must
+    # arrive complete and unduplicated: out-of-order segments must not
+    # advance RCV.NXT past the gap (silent loss), and retransmissions must
+    # not re-queue data. Byte-total accounting catches both (missing bytes
+    # < expected, duplicated bytes > expected).
+    if tc qdisc add dev tun0 root netem delay 3ms reorder 25% 50% loss 10% 2>/dev/null; then
+      python3 - <<'EOF'
+import socket
+s = socket.create_connection(("192.168.0.2", 8000), timeout=180)
+lines = ("B4LINE%06d" % i for i in range(80))
+data = "".join(l + "A" * (100 - len(l) - 1) + "\n" for l in lines)  # 80 x 100 = 8000 bytes
+s.sendall(data.encode())
+s.shutdown(socket.SHUT_WR)
+s.settimeout(180)
+while s.recv(4096):
+    pass
+s.close()
+EOF
+      # the client drains the server FIN immediately and exits while its
+      # data is still in flight; retransmissions under loss take seconds,
+      # so poll for the transfer to complete instead of a fixed sleep
+      got=0
+      for _ in $(seq 1 45); do
+        # 5 (test 1) + 8000 (test 5) bytes must have been read
+        got=$(grep -o "read [0-9]*b of data" /tmp/server.log | grep -o "[0-9]*" | awk "{s+=\$1} END{print s+0}")
+        [ "$got" -eq 8005 ] && break
+        sleep 2
+      done
+      # duplicate ACKs during the data phase prove out-of-order/duplicate
+      # segments actually arrived and were handled (otherwise vacuous)
+      dupacks=$(grep "^write(" /tmp/server.out | grep -o "ack: [0-9]*" | awk "\$2 < 8002" | uniq -d | wc -l)
+      echo "lossy transfer: $got/8005 bytes, $dupacks duplicate-ACK points"
+      [ "$got" -eq 8005 ] || { echo "FAIL: lossy transfer corrupted"; kill $pid; exit 1; }
+      [ "$dupacks" -ge 1 ] || { echo "FAIL: no duplicate/OOO handling exercised"; kill $pid; exit 1; }
+      tc qdisc del dev tun0 root
+    else
+      echo "NOTE: netem unavailable in this kernel; skipped loss test"
+    fi
 
     kill $pid 2>/dev/null || true
     echo "ALL LINUX TESTS PASSED"
